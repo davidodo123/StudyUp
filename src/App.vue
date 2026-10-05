@@ -5,7 +5,6 @@ import {
   Brain,
   CalendarDays,
   CheckCircle2,
-  Clock,
   GraduationCap,
   Layers,
   Loader2,
@@ -299,7 +298,7 @@ const handleSubmit = async (): Promise<void> => {
           <div
             class="w-fit rounded-lg border border-slate-700 bg-slate-800 px-3 py-1.5 text-xs font-semibold text-indigo-300"
           >
-            ⏱ {{ plan.horas_totales_estimadas }} h estimadas
+            {{ plan.horas_totales_estimadas }} h estimadas
           </div>
         </div>
 
@@ -342,7 +341,7 @@ const handleSubmit = async (): Promise<void> => {
                 <div class="space-y-1">
                   <h4 class="text-base font-bold text-white">{{ sesion.titulo }}</h4>
                   <p class="text-xs font-medium text-indigo-300">{{ sesion.tecnica }}</p>
-                  <p class="text-xs text-slate-400">💡 {{ sesion.consejo }}</p>
+                  <p class="text-xs text-slate-400">{{ sesion.consejo }}</p>
                 </div>
 
                 <div
@@ -389,11 +388,6 @@ const handleSubmit = async (): Promise<void> => {
           </h3>
           <p class="text-xs text-slate-300">{{ plan.alternativa_rapida }}</p>
         </div>
-
-        <p class="flex items-center gap-1.5 text-xs text-slate-500">
-          <Clock class="h-3.5 w-3.5" />
-          Plan generado por IA: ajústalo a tu temario real antes de seguirlo al pie de la letra.
-        </p>
       </article>
     </div>
   </main>

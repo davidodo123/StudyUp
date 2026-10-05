@@ -99,6 +99,7 @@ Esta es la sección más importante para una sesión nueva. Varias de estas deci
 | 12 | **`load_dotenv()` al importar el módulo** | Sin esto, el arranque local da HTTP 500 aunque exista el `.env`. En Vercel es un *no-op* porque las variables ya están inyectadas |
 | 13 | **`pract01-studyup.md` se genera con un script, no se edita a mano** | Ver §10. El documento inyecta el código real desde disco, así que no puede desincronizarse |
 | 14 | **`max_tokens=2000`** | La plantilla usaba 900, insuficiente para el caso peor (30 días) → JSON truncado → 502 intermitentes |
+| 15 | **Tope de sesiones `MAX_SESIONES = 14`, calculado en el servidor e inyectado en el *user prompt*** | Ni 2000 tokens bastaban: con 2 sesiones/día, a partir de ~14 días el modelo llegaba al límite (`finish_reason: length`) y el JSON salía cortado → 502 casi siempre. Como regla genérica en el *system prompt* el modelo la ignoraba; con un número concreto la cumple. Medido con `gpt-4o-mini`: 30 días → 13-14 sesiones, ~1400 tokens, 15-22 s. Es un entero derivado de `dias_disponibles` ya validado, así que no abre superficie de inyección. No subir `max_tokens` en su lugar: los planes largos tardarían 40-50 s |
 
 ### Trampas del entorno de este usuario (Windows)
 
@@ -296,11 +297,11 @@ Toda la integración con la IA vive en **un solo fichero**: [`api/index.py`](api
 | # | Qué pasa | Línea |
 | :-- | :--- | :--- |
 | 1 | Se carga el `.env` con la clave | `12`, `19` |
-| 2 | Entra la clave y se crea el cliente | `101-109` |
-| 3 | Se construyen los prompts | `123-170` |
-| 4 | **La llamada a la API** | `188-196` |
-| 5 | Se lee la respuesta del modelo | `204` |
-| 6 | Se valida esa respuesta (4 barreras → HTTP 502) | `205-232` |
+| 2 | Entra la clave y se crea el cliente | `104-112` |
+| 3 | Se construyen los prompts | `126-178` |
+| 4 | **La llamada a la API** | `196-204` |
+| 5 | Se lee la respuesta del modelo | `212` |
+| 6 | Se valida esa respuesta (4 barreras → HTTP 502) | `213-240` |
 
 La llamada en sí:
 
