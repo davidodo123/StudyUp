@@ -17,8 +17,9 @@ Este fichero tiene doble propósito:
 
 - **Frontend:** Vue 3 + TypeScript + Vite + Tailwind CSS
 - **Backend:** FastAPI (Python) como función *serverless*
-- **IA:** API de OpenAI (compatible con Groq vía `OPENAI_BASE_URL`)
+- **IA:** [OpenRouter](https://openrouter.ai) con el modelo `openai/gpt-4o-mini`, a través del SDK de OpenAI (`OPENAI_BASE_URL`). Lo indicó el profesor; la clave trae un saldo predeterminado. **No cambiar a modelos `:free`**
 - **Hosting:** Vercel, monorepositorio bajo el mismo origen
+- **URL pública:** https://study-up-beryl.vercel.app
 - **Repositorio:** https://github.com/davidodo123/StudyUp — rama `main`
 
 ### Es una práctica de clase, no un proyecto libre
@@ -54,10 +55,10 @@ Uno personal y uno de clase. El `.env` con la clave de API **no viaja por git** 
 | 4 | Frontend Vue 3 + Composition API | ✅ Completa |
 | 5 | Pruebas de frontend con Vitest | ✅ Completa, 7/7 |
 | 6.2 | Repositorio Git + push a GitHub | ✅ Hecho |
-| 6.3 | **Desplegar en Vercel con variables de entorno** | ❌ **PENDIENTE** |
-| 6.4 | **Verificar en producción (URL pública, sin fugas)** | ❌ **PENDIENTE** |
+| 6.3 | Desplegar en Vercel con variables de entorno | ✅ Hecho — https://study-up-beryl.vercel.app |
+| 6.4 | Verificar en producción (URL pública, sin fugas) | ✅ Verificado — falta solo la captura de F12 → Network para la entrega |
 
-**Lo único que falta del enunciado es el despliegue (§11).** Sin URL pública no se puede demostrar el objetivo de arquitectura serverless ni la verificación de que la clave no se filtra al cliente.
+**Todas las fases del enunciado están completas.**
 
 ### Verificación ejecutada
 
@@ -72,10 +73,9 @@ Todo esto se corrió de verdad, no es una estimación:
 | Arranque real del servidor | `uvicorn api.index:app --port 8000` | `GET /api/health` → `{"status":"ok", ...}` |
 | Diagramas UML | `node tools/check-mermaid.mjs pract01-studyup.md` | 5 de 5 válidos |
 | Fuga de secretos en el bundle | `grep -ric "openai\|sk-\|api_key" dist/` | 0 coincidencias |
-
-### Ficheros no versionados todavía
-
-Al cerrar la última sesión quedaban sin commitear: `instrucciones.md`, `CLAUDE.md` y el directorio `tools/`. Conviene comprobarlo con `git status` antes de dar nada por subido.
+| Producción: salud | `GET https://study-up-beryl.vercel.app/api/health` | 200 `{"status":"ok", ...}` |
+| Producción: generación real | `POST /api/generate-plan` (5 y 30 días) | 200 — 5 sesiones en ~6 s; 14 sesiones en ~32 s |
+| Producción: fuga de secretos | Buscar `sk-or`, `openai`, `openrouter`, `api_key` en el HTML/JS/CSS servidos | 0 coincidencias |
 
 ---
 
@@ -108,6 +108,8 @@ Esta es la sección más importante para una sesión nueva. Varias de estas deci
 | **Windows PowerShell 5.1 no acepta `&&`** | Un comando por línea. Ni `&&` ni `\|\|` ni `?:` ni `??` |
 | **`python.exe` en `WindowsApps` es el alias falso de la Microsoft Store** | El Python real está en `%LOCALAPPDATA%\Programs\Python\Python312`. Si `python --version` da el mensaje de la Store, es que el PATH de la terminal está desactualizado o el alias sigue activo |
 | **Tras instalar algo con `winget`, la terminal abierta no ve el PATH nuevo** | Reabrir la terminal, o refrescar el PATH (§4) |
+| **Refrescar el PATH con el `.venv` activado no sirve** | `Activate.ps1` llama primero a `deactivate`, que restaura el PATH *antiguo* guardado. Orden correcto: `deactivate` → refrescar PATH → `Activate.ps1`. O simplemente abrir una terminal nueva |
+| **`.venv` copiado de otro ordenador: `No Python at 'C:\Users\david\...'`** | Un venv guarda la ruta absoluta del Python que lo creó y no se puede mover. Borrarlo y recrearlo (§5.2) |
 | **Los heredocs de bash con contenido Python fallan en este entorno** | Para escribir ficheros con código, usar la herramienta `Write`, no `cat <<'EOF'` |
 | **`uvicorn` y `npm run dev` "cuelgan" la terminal** | Es lo normal en un servidor de desarrollo. Hacen falta dos terminales simultáneas |
 
@@ -128,7 +130,7 @@ Se revisó y tiene bugs reales: `nombre: str` (tipo Python) dentro de un `interf
 | Node.js | 20 LTS o superior | `node --version` |
 | Python | 3.10 – 3.12 | `python --version` |
 | Git | cualquiera reciente | `git --version` |
-| Clave de API | OpenAI (`sk-...`) o Groq (`gsk-...`) | — |
+| Clave de API | OpenRouter (`sk-or-v1-...`) | — |
 
 ### Si falta Node o Python
 
@@ -206,18 +208,17 @@ Copy-Item .env.example .env
 notepad .env
 ```
 
-Sustituye el placeholder por la clave real:
+Sustituye el placeholder por la clave real de OpenRouter. Las otras dos líneas ya vienen bien en la plantilla:
 
 ```env
-OPENAI_API_KEY=sk-aqui-va-tu-clave-de-verdad
+OPENAI_API_KEY=sk-or-v1-aqui-va-tu-clave-de-verdad
+OPENAI_BASE_URL=https://openrouter.ai/api/v1
+AI_MODEL=openai/gpt-4o-mini
 ```
 
-Para usar **Groq** en lugar de OpenAI, descomenta también:
+**Las tres son necesarias.** Sin `OPENAI_BASE_URL`, el SDK manda la clave de OpenRouter a la API de OpenAI y falla.
 
-```env
-OPENAI_BASE_URL=https://api.groq.com/openai/v1
-AI_MODEL=llama-3.3-70b-versatile
-```
+Escribe el `.env` con el Bloc de notas o la herramienta `Write`. Si lo generas con `Set-Content`/`Out-File` de PowerShell 5.1, usa `-Encoding ascii`: el BOM de UTF-8 corrompe el nombre de la primera variable.
 
 Si arrancas sin crear el `.env`, el backend responde HTTP 500 con `La variable de entorno OPENAI_API_KEY no está configurada en el servidor.` No es un bug: es el aislamiento de secretos funcionando.
 
@@ -366,49 +367,39 @@ Debe decir `5/5 diagramas válidos`.
 
 ---
 
-## 11. Desplegar en Vercel — PENDIENTE
+## 11. Despliegue en Vercel — HECHO
 
-Esto es lo único que falta del enunciado.
+**URL pública: https://study-up-beryl.vercel.app** (proyecto `study-up`, cuenta `davidodo123`, plan Hobby).
 
-### 11.1. Subir los cambios
+Vercel está conectado al repositorio: **cada `git push` a `main` despliega solo.** No hay que hacer nada en la web de Vercel salvo que cambien las variables.
 
-```powershell
-git add .
-```
+### 11.1. Cómo se montó (por si hay que repetirlo)
 
-```powershell
-git commit -m "docs: instrucciones y generador de la memoria"
-```
+1. https://vercel.com → **Continue with GitHub** → **Add New → Project** → importar `StudyUp`.
+2. Vercel detecta **Vite** y lee `requirements.txt` para la función Python. **No se toca ningún comando de build.**
+3. Variables de entorno (tipo **Secret**, entorno *Production*):
 
-```powershell
-git push
-```
+   | Key | Value |
+   | :--- | :--- |
+   | `OPENAI_API_KEY` | la clave de OpenRouter (`sk-or-v1-...`) |
+   | `OPENAI_BASE_URL` | `https://openrouter.ai/api/v1` |
+   | `AI_MODEL` | `openai/gpt-4o-mini` |
 
-### 11.2. Importar el proyecto
+### 11.2. Trampas de la interfaz de Vercel
 
-1. Entrar en https://vercel.com y pulsar **Add New → Project**.
-2. Seleccionar el repositorio `StudyUp`.
-3. Vercel detecta **Vite** automáticamente y lee `requirements.txt` para construir la función Python. **No hay que cambiar ningún comando de build.**
+| Qué pasa | Qué hacer |
+| :--- | :--- |
+| En *Settings* no hay "Environment Variables", solo "Environments" | Usar **Environment Variables** de la barra lateral del proyecto (fuera de *Settings*), o entrar en *Environments → Production*. **No** pulsar *Create Environment* (es de pago) |
+| *Key* y *Value* confundidos | *Key* es el **nombre** (`OPENAI_API_KEY`); *Value* es el contenido (la clave) |
+| Aviso naranja "Recommended: Change to Secret" | No es un error. Elegir **Secret** |
+| "A variable with the name … already exists" | Ya están guardadas. No añadir nada; solo hacer *Redeploy* |
+| HTTP 500 nombrando `OPENAI_API_KEY` tras añadir las variables | Las variables no se aplican a despliegues ya construidos: **Deployments → ⋯ (primera fila) → Redeploy** |
 
-### 11.3. Configurar las variables de entorno
+### 11.3. Verificación en producción (fase 6.4 del enunciado)
 
-En **Environment Variables**, *antes* de desplegar:
-
-| Nombre | Valor | ¿Obligatoria? |
-| :--- | :--- | :--- |
-| `OPENAI_API_KEY` | la clave (`sk-...` o `gsk-...`) | **Sí** |
-| `OPENAI_BASE_URL` | `https://api.groq.com/openai/v1` | solo con Groq |
-| `AI_MODEL` | `llama-3.3-70b-versatile` | solo con Groq |
-
-Marcarlas para los tres entornos: *Production*, *Preview* y *Development*.
-
-### 11.4. Verificar en producción (fase 6.4 del enunciado)
-
-1. Abrir `https://<tu-proyecto>.vercel.app/api/health`. Debe responder `{"status":"ok", ...}`. Si falla aquí, el problema está en la función Python, no en la interfaz.
+1. `https://study-up-beryl.vercel.app/api/health` → `{"status":"ok", ...}`. Si falla aquí, el problema está en la función Python, no en la interfaz.
 2. Abrir la raíz del sitio y generar un plan.
-3. Abrir F12 → pestaña **Network** → petición a `/api/generate-plan`. Debe ir al mismo origen (sin *preflight* de CORS) y **ninguna cabecera ni cuerpo debe contener la clave de API**. Esta es la demostración visual del RNF-01.
-
-> Las variables de entorno nuevas no se aplican a despliegues ya construidos. Si añades una después, hay que volver a desplegar.
+3. F12 → pestaña **Network** → petición a `/api/generate-plan`. Debe ir al mismo origen (sin *preflight* de CORS) y **ninguna cabecera ni cuerpo debe contener la clave de API**. Esta es la demostración visual del RNF-01. **Hacer captura para la entrega.**
 
 ---
 
@@ -427,7 +418,7 @@ Resumen en el equipo nuevo: clonar → `npm ci` → crear venv → `pip install 
 
 ### Si solo hay que enseñar la aplicación
 
-No montes nada. Despliega en Vercel (§11) y abre la URL pública en el navegador del otro equipo. Cero instalaciones y, sobre todo, **la clave no pisa ese ordenador**.
+No montes nada. Abre https://study-up-beryl.vercel.app en el navegador del otro equipo. Cero instalaciones y, sobre todo, **la clave no pisa ese ordenador**.
 
 ### Flujo entre dos ordenadores
 

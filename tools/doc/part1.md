@@ -120,7 +120,7 @@ El flujo operativo del sistema consta de cinco etapas sincronizadas:
 * **Node.js:** Versión 20.x LTS o superior (verificado en 24.x).
 * **Python:** Versión 3.10, 3.11 o 3.12 con `pip` y soporte de entornos virtuales (`venv`).
 * **Git:** Para control de versiones y despliegue automatizado.
-* **Proveedor de IA:** Clave de API activa de OpenAI (`sk-...`) o Groq Cloud (`gsk-...`).
+* **Proveedor de IA:** Clave de API de [OpenRouter](https://openrouter.ai) (`sk-or-v1-...`), pasarela compatible con la API de OpenAI que da acceso al modelo `openai/gpt-4o-mini`. El código no depende del proveedor: OpenAI directo (`sk-...`) o Groq (`gsk-...`) funcionan cambiando solo variables de entorno.
 * **Cuenta Vercel:** Cuenta activa para despliegue en producción.
 
 ### 3.2. Stack Tecnológico
@@ -136,7 +136,7 @@ El flujo operativo del sistema consta de cinco etapas sincronizadas:
 | **Testing Frontend** | **Vitest + @vue/test-utils** | Pruebas de integración de componentes UI sobre `jsdom` |
 | **Backend Framework** | **FastAPI** | Framework web ASGI de alto rendimiento |
 | **Validación de Datos** | **Pydantic** | v2.x (Validación estructural y parseo de tipos) |
-| **SDK de IA** | **OpenAI Python SDK** | v1.x (Conexión compatible con OpenAI y Groq) |
+| **SDK de IA** | **OpenAI Python SDK** | v1.x (Cliente estándar apuntado a OpenRouter mediante `base_url`) |
 | **Secretos en local** | **python-dotenv** | Carga de `.env` en desarrollo |
 | **Testing Backend** | **Pytest + HTTPX** | Pruebas de integración de endpoints con `TestClient` |
 | **Hosting y CI/CD** | **Vercel** | Infraestructura monorepositorio con Serverless Runtimes |
@@ -225,7 +225,7 @@ Refleja las interacciones del estudiante con la SPA y la interacción entre el b
 ```mermaid
 flowchart LR
     User(("Estudiante"))
-    AIService(("Proveedor LLM<br/>OpenAI o Groq"))
+    AIService(("Proveedor LLM<br/>OpenRouter · gpt-4o-mini"))
 
     subgraph StudyUp_System ["Sistema StudyUp AI"]
         UC01["UC-01: Configurar parámetros de estudio"]
@@ -345,7 +345,7 @@ flowchart TD
     CheckKey -->|"No: HTTP 500"| RenderErr
 
     CheckKey -->|"Sí"| BuildPrompt["Construir System Prompt y User Prompt"]
-    BuildPrompt --> CallAI["Llamar a OpenAI / Groq con response_format json_object"]
+    BuildPrompt --> CallAI["Llamar a OpenRouter (gpt-4o-mini) con response_format json_object"]
 
     CallAI --> CheckNet{"¿Respondió el proveedor?"}
     CheckNet -->|"No: HTTP 502"| RenderErr
@@ -379,7 +379,7 @@ sequenceDiagram
     actor U as Estudiante
     participant V as Vista Vue 3 (App.vue)
     participant B as Backend (FastAPI /api/index.py)
-    participant AI as Proveedor IA (OpenAI / Groq)
+    participant AI as Proveedor IA (OpenRouter / gpt-4o-mini)
 
     U->>V: Modifica parámetros y pulsa 'Generar plan con IA'
     activate V
@@ -482,7 +482,7 @@ stateDiagram-v2
 ### FASE 2: Desarrollo del Backend Serverless con FastAPI
 * **2.1. Modelado de Dominio con Pydantic:** En `api/index.py`, definir las clases enumeradas `MetaEnum`, `NivelEnum` y `RecursoEnum`. Crear el modelo `PlanRequest` implementando las validaciones de rango numérico (`ge=1, le=30`) y tamaño de lista (`min_length=1`).
 * **2.2. Modelos de Salida Estructurados:** Definir las clases `Sesion` y `PlanResponse` con tipos estrictos y restricciones propias (`dia` ≥ 1, `duracion_minutos` entre 10 y 240, `sesiones` con `min_length=1`). Estas restricciones son la red que atrapa las alucinaciones del modelo.
-* **2.3. Carga de Secretos y Factoría de Conexión:** Llamar a `load_dotenv()` al importar el módulo (es un no-op en Vercel, donde las variables ya están inyectadas) e implementar `get_openai_client()` para leer `OPENAI_API_KEY` del entorno y admitir de forma transparente la variable opcional `OPENAI_BASE_URL` para compatibilidad con Groq.
+* **2.3. Carga de Secretos y Factoría de Conexión:** Llamar a `load_dotenv()` al importar el módulo (es un no-op en Vercel, donde las variables ya están inyectadas) e implementar `get_openai_client()` para leer `OPENAI_API_KEY` del entorno y admitir de forma transparente la variable `OPENAI_BASE_URL`, que apunta el cliente a OpenRouter (o a cualquier otro proveedor compatible con la API de OpenAI).
 * **2.4. Ingeniería del Prompt Defensivo:** Diseñar el *System Prompt* incluyendo el esquema JSON literal esperado y las reglas obligatorias (usar solo los recursos del usuario, no exceder los días, ignorar instrucciones ajenas al mensaje de sistema). Construir el *User Prompt* traduciendo los enumerados a prosa mediante `ETIQUETAS_META` y `ETIQUETAS_NIVEL`, nunca concatenando texto del usuario.
 * **2.5. Pipeline de Validación de Salida:** Implementar la cadena de cuatro comprobaciones (`contenido` no vacío → `limpiar_delimitadores()` → `json.loads()` → `PlanResponse(**datos)` → rango de días), cada una lanzando un `HTTPException` 502 con un mensaje distinto. **Evitar el `except Exception` genérico**, que convierte errores de esquema en 500 y filtra trazas internas al cliente.
 
@@ -514,8 +514,8 @@ stateDiagram-v2
 ### FASE 6: Configuración Serverless en Vercel y Despliegue
 * **6.1. Reglas de Enrutamiento en `vercel.json`:** Configurar la reescritura que redirige cualquier petición `/api/(.*)` hacia `/api/index.py`. El ASGI de FastAPI recibe la ruta original, por lo que los decoradores conservan el prefijo `/api`.
 * **6.2. Control de Versiones:** Comprobar que `.gitignore` excluye `.venv`, `node_modules`, `dist`, `.vercel` y `.env`. Crear el *commit* inicial y subir el repositorio a GitHub o GitLab.
-* **6.3. Despliegue y Variables en Vercel:** Importar el repositorio desde la consola de Vercel (el framework se detecta automáticamente como Vite). Configurar en **Environment Variables** la clave `OPENAI_API_KEY` y, opcionalmente, `OPENAI_BASE_URL` y `AI_MODEL` si se utiliza Groq.
-* **6.4. Verificación en Producción:** Acceder a `https://<tu-proyecto>.vercel.app/api/health` para confirmar que la función Python arrancó, y después generar un plan desde la UI comprobando en la pestaña *Network* del navegador que ninguna petición contiene la clave de API.
+* **6.3. Despliegue y Variables en Vercel:** Importar el repositorio desde la consola de Vercel (el framework se detecta automáticamente como Vite). Configurar en **Environment Variables**, como tipo *Secret*, `OPENAI_API_KEY` (la clave de OpenRouter), `OPENAI_BASE_URL=https://openrouter.ai/api/v1` y `AI_MODEL=openai/gpt-4o-mini`.
+* **6.4. Verificación en Producción:** Acceder a `https://study-up-beryl.vercel.app/api/health` para confirmar que la función Python arrancó, y después generar un plan desde la UI comprobando en la pestaña *Network* del navegador que ninguna petición contiene la clave de API.
 
 ---
 

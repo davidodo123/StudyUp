@@ -4,13 +4,14 @@
 
 ## Lo mínimo para orientarse
 
-Práctica de clase. SPA que genera planes de estudio con IA. Vue 3 + TypeScript + Vite + Tailwind en el cliente; FastAPI (Python) como función serverless en Vercel; OpenAI (o Groq) como proveedor de IA.
+Práctica de clase. SPA que genera planes de estudio con IA. Vue 3 + TypeScript + Vite + Tailwind en el cliente; FastAPI (Python) como función serverless en Vercel; OpenRouter (`openai/gpt-4o-mini`, vía el SDK de OpenAI) como proveedor de IA.
 
 [`pract01-vercel.md`](pract01-vercel.md) **es la plantilla del enunciado** (otra app: *FitAdapt*, rutinas de gimnasio). StudyUp replica su stack y su estructura de memoria cambiando el dominio. Ante una duda de estructura, la respuesta por defecto es "como lo hace la plantilla"; las desviaciones están justificadas en §3 de `instrucciones.md` y son deliberadas.
 
 - Repositorio: https://github.com/davidodo123/StudyUp — rama `main`
 - Entregable académico: `pract01-studyup.md`
-- **Pendiente: desplegar en Vercel** (fases 6.3 y 6.4 del enunciado). Todo lo demás está hecho y verificado.
+- Producción: https://study-up-beryl.vercel.app — cada `git push` a `main` despliega solo.
+- **Todas las fases del enunciado están hechas y verificadas**, incluido el despliegue.
 
 ## Reglas que no se negocian
 
@@ -20,6 +21,8 @@ Práctica de clase. SPA que genera planes de estudio con IA. Vue 3 + TypeScript 
 4. **`pract01-studyup.md` no se edita a mano.** Se regenera con `node tools/build-doc.mjs`, que inyecta el código real. Para cambiar la prosa, editar `tools/doc/part1.md` o `tools/doc/part3.md`.
 5. **No bajar `vue-tsc` por debajo de `^3.1`.** La versión 1.8 es incompatible con TypeScript ≥5.5.
 6. **No añadir middleware de CORS.** Frontend y backend comparten origen.
+7. **No cambiar el modelo a uno `:free` de OpenRouter.** Lo eligió el profesor y la clave trae saldo.
+8. **No subir `max_tokens` para arreglar JSON truncado.** Se limita el número de sesiones con `MAX_SESIONES` (§3, decisión 15).
 
 ## Entorno (Windows)
 
@@ -39,4 +42,4 @@ npm run typecheck                        # debe dar 0 errores
 node tools/build-doc.mjs                 # regenerar la memoria de la práctica
 ```
 
-El `.env` con la clave **no está en git**. En una máquina nueva: `Copy-Item .env.example .env` y pegar la clave. Ver §6 y §13 de `instrucciones.md`.
+El `.env` con la clave **no está en git**. En una máquina nueva: `Copy-Item .env.example .env` y pegar la clave de OpenRouter (la plantilla ya trae `OPENAI_BASE_URL` y `AI_MODEL`). Ver §6 y §13 de `instrucciones.md`.
