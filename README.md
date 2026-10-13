@@ -122,7 +122,7 @@ Si algo falla, responde 401 sin llegar a llamar a la IA. El endpoint de salud si
 curl.exe -i -X POST https://study-up-beryl.vercel.app/api/generate-plan -H "Content-Type: application/json" -d "{\"meta\":\"aprobar\",\"dias_disponibles\":5,\"recursos\":[\"apuntes\"],\"nivel\":\"intermedio\"}"
 ```
 
-La respuesta esperada es `401 Unauthorized` con el mensaje "Debes iniciar sesión para generar un plan." Estado: funciona en local. Faltan el redespliegue en Vercel con las variables de Clerk y las capturas.
+Responde `401 Unauthorized` con el mensaje "Debes iniciar sesión para generar un plan.". Con un token inventado, la respuesta es `401` con "La sesión no es válida.". Estado: funciona en local y en Vercel, después de añadir las variables de Clerk y volver a desplegar. Faltan las capturas.
 
 ## 8. Docker
 
