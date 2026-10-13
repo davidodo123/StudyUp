@@ -1,9 +1,9 @@
 # StudyUp AI — Instrucciones y contexto
 
-Este fichero tiene doble propósito:
+Este fichero tiene dos partes:
 
-1. **Traspaso de contexto** (§1–§3) para un asistente que abra este repositorio sin memoria de las sesiones anteriores: qué es el proyecto, en qué estado está y qué decisiones no deben deshacerse.
-2. **Manual de operación** (§4–§14) para montar, ejecutar, verificar y desplegar el proyecto en cualquier ordenador.
+1. **Contexto** (§1–§3): qué es el proyecto, en qué estado está y qué decisiones de diseño no deben deshacerse.
+2. **Manual de operación** (§4–§14): cómo montar, ejecutar, verificar y desplegar el proyecto en cualquier ordenador.
 
 > La memoria técnica de la práctica (especificación, UML, requisitos, código comentado) está en [`pract01-studyup.md`](pract01-studyup.md). Ese es el entregable académico; este fichero es el manual.
 
@@ -37,7 +37,7 @@ El mapeo de parámetros entre ambas es uno a uno:
 
 **Implicación práctica:** si hay que decidir cómo estructurar algo nuevo, la respuesta por defecto es "como lo hace `pract01-vercel.md`". Las desviaciones están justificadas en §3 y son deliberadas.
 
-### El usuario trabaja en dos ordenadores
+### Se trabaja en dos ordenadores
 
 Uno personal y uno de clase. El `.env` con la clave de API **no viaja por git** (ver §6 y §13). Al cambiar de máquina hay que recrearlo a mano.
 
@@ -62,7 +62,7 @@ Uno personal y uno de clase. El `.env` con la clave de API **no viaja por git** 
 
 ### Verificación ejecutada
 
-Todo esto se corrió de verdad, no es una estimación:
+Comprobaciones ejecutadas y resultados obtenidos:
 
 | Comprobación | Comando | Resultado |
 | :--- | :--- | :--- |
@@ -81,7 +81,7 @@ Todo esto se corrió de verdad, no es una estimación:
 
 ## 3. Decisiones de diseño — no deshacer sin motivo
 
-Esta es la sección más importante para una sesión nueva. Varias de estas decisiones **se desvían a propósito de la plantilla `pract01-vercel.md`**, que tiene fallos reales. Deshacerlas rompe el proyecto o reintroduce un bug.
+Conviene leer esta sección antes de modificar el código. Varias de estas decisiones **se desvían a propósito de la plantilla `pract01-vercel.md`**, que tiene fallos reales. Deshacerlas rompe el proyecto o reintroduce un bug.
 
 | # | Decisión | Por qué |
 | :-- | :--- | :--- |
@@ -101,7 +101,7 @@ Esta es la sección más importante para una sesión nueva. Varias de estas deci
 | 14 | **`max_tokens=2000`** | La plantilla usaba 900, insuficiente para el caso peor (30 días) → JSON truncado → 502 intermitentes |
 | 15 | **Tope de sesiones `MAX_SESIONES = 14`, calculado en el servidor e inyectado en el *user prompt*** | Ni 2000 tokens bastaban: con 2 sesiones/día, a partir de ~14 días el modelo llegaba al límite (`finish_reason: length`) y el JSON salía cortado → 502 casi siempre. Como regla genérica en el *system prompt* el modelo la ignoraba; con un número concreto la cumple. Medido con `gpt-4o-mini`: 30 días → 13-14 sesiones, ~1400 tokens, 15-22 s. Es un entero derivado de `dias_disponibles` ya validado, así que no abre superficie de inyección. No subir `max_tokens` en su lugar: los planes largos tardarían 40-50 s |
 
-### Trampas del entorno de este usuario (Windows)
+### Trampas del entorno (Windows)
 
 | Trampa | Qué hacer |
 | :--- | :--- |
@@ -110,14 +110,13 @@ Esta es la sección más importante para una sesión nueva. Varias de estas deci
 | **Tras instalar algo con `winget`, la terminal abierta no ve el PATH nuevo** | Reabrir la terminal, o refrescar el PATH (§4) |
 | **Refrescar el PATH con el `.venv` activado no sirve** | `Activate.ps1` llama primero a `deactivate`, que restaura el PATH *antiguo* guardado. Orden correcto: `deactivate` → refrescar PATH → `Activate.ps1`. O simplemente abrir una terminal nueva |
 | **`.venv` copiado de otro ordenador: `No Python at 'C:\Users\david\...'`** | Un venv guarda la ruta absoluta del Python que lo creó y no se puede mover. Borrarlo y recrearlo (§5.2) |
-| **Los heredocs de bash con contenido Python fallan en este entorno** | Para escribir ficheros con código, usar la herramienta `Write`, no `cat <<'EOF'` |
 | **`uvicorn` y `npm run dev` "cuelgan" la terminal** | Es lo normal en un servidor de desarrollo. Hacen falta dos terminales simultáneas |
 
 ### Sobre la plantilla `pract01-vercel.md`
 
 Se revisó y tiene bugs reales: `nombre: str` (tipo Python) dentro de un `interface` de TypeScript, ausencia de `load_dotenv()`, el CORS inválido ya mencionado, `except Exception` genérico, tests dentro de `api/`, y `vue-tsc@1.8`. StudyUp los corrige todos.
 
-**Dos avisos que se dieron sobre esa plantilla eran falsos** y no hay que repetirlos: los labels de Mermaid `|<<include>>|` y `-- No (HTTP 422) -->` **sí son válidos**; se comprobó con el parser real y los 5 diagramas de la plantilla pasan.
+En cambio, los labels de Mermaid `|<<include>>|` y `-- No (HTTP 422) -->` de la plantilla **sí son válidos**: se comprobó con el parser real y sus 5 diagramas pasan.
 
 ---
 
@@ -218,7 +217,7 @@ AI_MODEL=openai/gpt-4o-mini
 
 **Las tres son necesarias.** Sin `OPENAI_BASE_URL`, el SDK manda la clave de OpenRouter a la API de OpenAI y falla.
 
-Escribe el `.env` con el Bloc de notas o la herramienta `Write`. Si lo generas con `Set-Content`/`Out-File` de PowerShell 5.1, usa `-Encoding ascii`: el BOM de UTF-8 corrompe el nombre de la primera variable.
+Escribe el `.env` con el Bloc de notas. Si lo generas con `Set-Content`/`Out-File` de PowerShell 5.1, usa `-Encoding ascii`: el BOM de UTF-8 corrompe el nombre de la primera variable.
 
 Si arrancas sin crear el `.env`, el backend responde HTTP 500 con `La variable de entorno OPENAI_API_KEY no está configurada en el servidor.` No es un bug: es el aislamiento de secretos funcionando.
 
