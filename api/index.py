@@ -4,13 +4,16 @@ Expone dos endpoints bajo /api y actúa como intermediario seguro entre el
 cliente Vue y el proveedor de IA. La clave privada nunca sale de este proceso.
 """
 
+import base64
 import json
 import os
 from enum import Enum
-from typing import List
+from functools import lru_cache
+from typing import List, Optional
 
+import jwt
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, Header, HTTPException, status
 from openai import OpenAI, OpenAIError
 from pydantic import BaseModel, Field, ValidationError
 
@@ -23,6 +26,88 @@ app = FastAPI(
     description="Backend serverless para la generación estructurada de planes de estudio",
     version="1.0.0",
 )
+
+# ---------------------------------------------------------------------------
+# 0. Autenticación con Clerk (barrera previa: HTTP 401)
+# ---------------------------------------------------------------------------
+
+# Orígenes desde los que se acepta un token (claim azp). En local basta el de Vite;
+# en Vercel se fija CLERK_AUTHORIZED_PARTIES con la URL pública.
+ORIGENES_POR_DEFECTO = "http://localhost:5173"
+
+
+def _error_401(detalle: str) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail=detalle,
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+
+def clerk_issuer() -> str:
+    """Deduce el emisor de los tokens a partir de la clave publicable de Clerk.
+
+    La clave tiene la forma pk_test_<base64("<frontend-api>$")>, así que no hace
+    falta una variable de entorno más con la URL de Clerk.
+    """
+    clave = os.getenv("VITE_CLERK_PUBLISHABLE_KEY", "")
+    try:
+        codificado = clave.split("_", 2)[2]
+        dominio = base64.b64decode(codificado + "=" * (-len(codificado) % 4)).decode()
+    except (IndexError, ValueError):
+        dominio = ""
+    if not dominio.endswith("$"):
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="La variable de entorno VITE_CLERK_PUBLISHABLE_KEY no está configurada en el servidor.",
+        )
+    return f"https://{dominio[:-1]}"
+
+
+@lru_cache(maxsize=4)
+def jwks_client(issuer: str) -> jwt.PyJWKClient:
+    """Cliente de claves públicas de Clerk, cacheado entre peticiones."""
+    return jwt.PyJWKClient(f"{issuer}/.well-known/jwks.json", cache_keys=True, lifespan=3600)
+
+
+def get_current_user(authorization: Optional[str] = Header(default=None)) -> str:
+    """Valida el token de sesión de Clerk y devuelve el id del usuario (claim sub)."""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise _error_401("Debes iniciar sesión para generar un plan.")
+    token = authorization.removeprefix("Bearer ").strip()
+
+    issuer = clerk_issuer()
+    try:
+        clave = jwks_client(issuer).get_signing_key_from_jwt(token)
+    except jwt.PyJWKClientConnectionError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="No se pudo contactar con Clerk para verificar la sesión.",
+        ) from exc
+    except (jwt.PyJWKClientError, jwt.InvalidTokenError) as exc:
+        raise _error_401("La sesión no es válida.") from exc
+
+    try:
+        claims = jwt.decode(
+            token,
+            clave.key,
+            algorithms=["RS256"],
+            issuer=issuer,
+            options={"require": ["exp", "iat", "iss", "sub"]},
+            leeway=5,
+        )
+    except jwt.ExpiredSignatureError as exc:
+        raise _error_401("La sesión ha caducado. Vuelve a iniciar sesión.") from exc
+    except jwt.InvalidTokenError as exc:
+        raise _error_401("La sesión no es válida.") from exc
+
+    origenes = os.getenv("CLERK_AUTHORIZED_PARTIES", ORIGENES_POR_DEFECTO)
+    permitidos = {origen.strip().rstrip("/") for origen in origenes.split(",") if origen.strip()}
+    if claims.get("azp") and claims["azp"] not in permitidos:
+        raise _error_401("La sesión procede de un origen no autorizado.")
+
+    return claims["sub"]
+
 
 # ---------------------------------------------------------------------------
 # 1. Esquemas de validación de entrada (primera barrera: HTTP 422)
@@ -189,7 +274,7 @@ def health_check() -> dict:
 
 
 @app.post("/api/generate-plan", response_model=PlanResponse)
-def generate_plan(payload: PlanRequest) -> PlanResponse:
+def generate_plan(payload: PlanRequest, usuario: str = Depends(get_current_user)) -> PlanResponse:
     client = get_openai_client()
 
     try:

@@ -3,6 +3,25 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import App from '../src/App.vue';
 import type { PlanResponse } from '../src/types/plan';
 
+// Clerk simulado: cada test decide si hay sesión y qué token devuelve.
+const clerk = vi.hoisted(() => ({ signedIn: true, token: 'token-de-prueba' as string | null }));
+
+vi.mock('@clerk/vue', async () => {
+  const { defineComponent, h, ref } = await import('vue');
+  return {
+    Show: defineComponent({
+      props: ['when'],
+      setup: (_, { slots }) => () => (clerk.signedIn ? slots.default?.() : slots.fallback?.()),
+    }),
+    SignInButton: defineComponent({
+      props: ['mode'],
+      setup: (_, { slots }) => () => slots.default?.(),
+    }),
+    UserButton: defineComponent({ setup: () => () => h('div', { 'data-test': 'user-button' }) }),
+    useAuth: () => ({ getToken: ref(async () => clerk.token) }),
+  };
+});
+
 const PLAN_MOCK: PlanResponse = {
   diagnostico: 'Tienes el temario a medias, así que atacamos primero las lagunas.',
   sesiones: [
@@ -43,6 +62,8 @@ const mockFetchOk = (plan: PlanResponse = PLAN_MOCK) => {
 describe('StudyUp - componente App.vue', () => {
   beforeEach(() => {
     vi.restoreAllMocks();
+    clerk.signedIn = true;
+    clerk.token = 'token-de-prueba';
   });
 
   afterEach(() => {
@@ -70,6 +91,9 @@ describe('StudyUp - componente App.vue', () => {
     const [url, opciones] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(url).toBe('/api/generate-plan');
     expect(opciones.method).toBe('POST');
+    expect((opciones.headers as Record<string, string>).Authorization).toBe(
+      'Bearer token-de-prueba',
+    );
     expect(JSON.parse(opciones.body as string)).toEqual({
       meta: 'aprobar',
       dias_disponibles: 7,
@@ -167,5 +191,26 @@ describe('StudyUp - componente App.vue', () => {
 
     expect(wrapper.find('fieldset').attributes('disabled')).toBeUndefined();
     expect(wrapper.text()).toContain('Tu plan de estudio');
+  });
+
+  it('sin sesión muestra el acceso y oculta el formulario', () => {
+    clerk.signedIn = false;
+    const wrapper = mount(App);
+
+    expect(wrapper.text()).toContain('Inicia sesión para crear tu plan');
+    expect(wrapper.find('form').exists()).toBe(false);
+    expect(wrapper.find('[data-test="user-button"]').exists()).toBe(false);
+  });
+
+  it('no llama al backend si Clerk no entrega un token', async () => {
+    clerk.token = null;
+    const fetchMock = mockFetchOk();
+    const wrapper = mount(App);
+
+    await wrapper.find('form').trigger('submit.prevent');
+    await flushPromises();
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(wrapper.text()).toContain('Tu sesión ha caducado');
   });
 });

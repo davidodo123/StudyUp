@@ -11,6 +11,8 @@
     "typecheck": "vue-tsc --noEmit"
   },
   "dependencies": {
+    "@clerk/localizations": "^4.23.0",
+    "@clerk/vue": "^2.5.12",
     "lucide-vue-next": "^0.344.0",
     "vue": "^3.4.21"
   },

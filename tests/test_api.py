@@ -1,17 +1,31 @@
 """Suite de pruebas del backend de StudyUp.
 
 El proveedor de IA se sustituye siempre por un mock, de modo que la suite no
-consume tokens reales ni necesita una OPENAI_API_KEY válida.
+consume tokens reales ni necesita una OPENAI_API_KEY válida. Los tokens de Clerk
+se firman con una clave RSA generada aquí, así que tampoco hace falta red.
 """
 
+import base64
 import json
+import time
 from unittest.mock import MagicMock, patch
 
+import jwt
+import pytest
+from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi.testclient import TestClient
 
-from api.index import app
+from api.index import app, clerk_issuer, get_current_user
 
 client = TestClient(app)
+
+
+@pytest.fixture(autouse=True)
+def usuario_autenticado():
+    """Por defecto los tests asumen una sesión válida; los de Clerk la quitan."""
+    app.dependency_overrides[get_current_user] = lambda: "user_test"
+    yield
+    app.dependency_overrides.clear()
 
 PLAN_VALIDO = {
     "diagnostico": "Partes con el temario a medias, así que priorizamos lagunas y repaso activo.",
@@ -183,3 +197,103 @@ def test_sin_api_key_devuelve_500():
 
     assert response.status_code == 500
     assert "OPENAI_API_KEY" in response.json()["detail"]
+
+
+# ---------------------------------------------------------------------------
+# Autenticación con Clerk (HTTP 401): ningún rechazo debe llegar a la IA
+# ---------------------------------------------------------------------------
+
+DOMINIO_CLERK = "studyup-test.clerk.accounts.dev"
+ISSUER = f"https://{DOMINIO_CLERK}"
+CLAVE_PUBLICABLE = "pk_test_" + base64.b64encode(f"{DOMINIO_CLERK}$".encode()).decode()
+CLAVE_CLERK = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+OTRA_CLAVE = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+
+
+def _token(clave=CLAVE_CLERK, **cambios) -> str:
+    """Firma un token con la forma de un token de sesión de Clerk."""
+    ahora = int(time.time())
+    claims = {
+        "sub": "user_123",
+        "iss": ISSUER,
+        "iat": ahora,
+        "nbf": ahora,
+        "exp": ahora + 60,
+        "azp": "http://localhost:5173",
+        **cambios,
+    }
+    return jwt.encode(claims, clave, algorithm="RS256", headers={"kid": "clave-test"})
+
+
+@pytest.fixture
+def clerk_real():
+    """Quita la sesión simulada y sirve la clave pública de prueba como JWKS."""
+    app.dependency_overrides.clear()
+    jwks = MagicMock()
+    jwks.get_signing_key_from_jwt.return_value = MagicMock(key=CLAVE_CLERK.public_key())
+    with patch.dict("os.environ", {"VITE_CLERK_PUBLISHABLE_KEY": CLAVE_PUBLICABLE}), patch(
+        "api.index.jwks_client", return_value=jwks
+    ), patch("api.index.get_openai_client") as mock_get_client:
+        mock_get_client.return_value = _mock_client_con(json.dumps(PLAN_VALIDO))
+        yield mock_get_client
+
+
+def _pedir(token: str | None):
+    cabeceras = {"Authorization": f"Bearer {token}"} if token else {}
+    return client.post("/api/generate-plan", json=PETICION_VALIDA, headers=cabeceras)
+
+
+def test_el_emisor_se_deduce_de_la_clave_publicable():
+    with patch.dict("os.environ", {"VITE_CLERK_PUBLISHABLE_KEY": CLAVE_PUBLICABLE}):
+        assert clerk_issuer() == ISSUER
+
+
+def test_token_valido_genera_el_plan(clerk_real):
+    response = _pedir(_token())
+
+    assert response.status_code == 200
+    clerk_real.assert_called_once()
+
+
+def test_sin_token_devuelve_401(clerk_real):
+    response = _pedir(None)
+
+    assert response.status_code == 401
+    assert response.headers["WWW-Authenticate"] == "Bearer"
+    clerk_real.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "token",
+    [
+        "esto-no-es-un-jwt",
+        _token(clave=OTRA_CLAVE),
+        _token(iss="https://otro-proyecto.clerk.accounts.dev"),
+        _token(azp="https://web-ajena.example"),
+        jwt.encode({"sub": "user_123", "iss": ISSUER}, "s" * 32, algorithm="HS256"),
+    ],
+    ids=["mal_formado", "firma_ajena", "otro_emisor", "origen_no_autorizado", "algoritmo_hs256"],
+)
+def test_token_invalido_devuelve_401(clerk_real, token):
+    response = _pedir(token)
+
+    assert response.status_code == 401
+    clerk_real.assert_not_called()
+
+
+def test_token_caducado_devuelve_401(clerk_real):
+    hace_una_hora = int(time.time()) - 3600
+    response = _pedir(_token(iat=hace_una_hora, nbf=hace_una_hora, exp=hace_una_hora + 60))
+
+    assert response.status_code == 401
+    assert "caducado" in response.json()["detail"]
+    clerk_real.assert_not_called()
+
+
+def test_sin_clave_de_clerk_devuelve_500(clerk_real):
+    with patch.dict("os.environ", {}, clear=True):
+        response = _pedir(_token())
+
+    assert response.status_code == 500
+    assert "VITE_CLERK_PUBLISHABLE_KEY" in response.json()["detail"]
+    clerk_real.assert_not_called()

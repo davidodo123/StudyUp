@@ -559,6 +559,8 @@ Nótese la separación de `requirements.txt` y `requirements-dev.txt`: Vercel in
     "typecheck": "vue-tsc --noEmit"
   },
   "dependencies": {
+    "@clerk/localizations": "^4.23.0",
+    "@clerk/vue": "^2.5.12",
     "lucide-vue-next": "^0.344.0",
     "vue": "^3.4.21"
   },
@@ -583,6 +585,7 @@ fastapi>=0.110.0
 pydantic>=2.6.1
 openai>=1.12.0
 python-dotenv>=1.0.1
+PyJWT[crypto]>=2.10.0
 ```
 
 #### `requirements-dev.txt`
@@ -643,6 +646,14 @@ python_files = test_*.py
 #### `src/env.d.ts`
 ```typescript
 /// <reference types="vite/client" />
+
+interface ImportMetaEnv {
+  readonly VITE_CLERK_PUBLISHABLE_KEY: string;
+}
+
+interface ImportMeta {
+  readonly env: ImportMetaEnv;
+}
 
 declare module '*.vue' {
   import type { DefineComponent } from 'vue';
@@ -715,7 +726,13 @@ OPENAI_API_KEY=sk-or-v1-tu-clave-de-openrouter-aqui
 OPENAI_BASE_URL=https://openrouter.ai/api/v1
 AI_MODEL=openai/gpt-4o-mini
 
-# Alternativas compatibles con la API de OpenAI (sustituyen a las dos líneas de arriba):
+# Clerk: clave PUBLICABLE (pk_test_...), no la secreta. La usan Vue y FastAPI.
+VITE_CLERK_PUBLISHABLE_KEY=pk_test_tu-clave-publicable-de-clerk
+# Orígenes desde los que se aceptan sesiones, separados por comas.
+# En local basta el de Vite; en Vercel: https://study-up-beryl.vercel.app
+CLERK_AUTHORIZED_PARTIES=http://localhost:5173
+
+# Alternativas compatibles con la API de OpenAI (sustituyen a las dos primeras líneas de arriba):
 # OpenAI directo: borrar OPENAI_BASE_URL y usar AI_MODEL=gpt-4o-mini con una clave sk-...
 # Groq: OPENAI_BASE_URL=https://api.groq.com/openai/v1 y AI_MODEL=llama-3.3-70b-versatile
 ```
@@ -780,13 +797,16 @@ Expone dos endpoints bajo /api y actúa como intermediario seguro entre el
 cliente Vue y el proveedor de IA. La clave privada nunca sale de este proceso.
 """
 
+import base64
 import json
 import os
 from enum import Enum
-from typing import List
+from functools import lru_cache
+from typing import List, Optional
 
+import jwt
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, Header, HTTPException, status
 from openai import OpenAI, OpenAIError
 from pydantic import BaseModel, Field, ValidationError
 
@@ -799,6 +819,88 @@ app = FastAPI(
     description="Backend serverless para la generación estructurada de planes de estudio",
     version="1.0.0",
 )
+
+# ---------------------------------------------------------------------------
+# 0. Autenticación con Clerk (barrera previa: HTTP 401)
+# ---------------------------------------------------------------------------
+
+# Orígenes desde los que se acepta un token (claim azp). En local basta el de Vite;
+# en Vercel se fija CLERK_AUTHORIZED_PARTIES con la URL pública.
+ORIGENES_POR_DEFECTO = "http://localhost:5173"
+
+
+def _error_401(detalle: str) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail=detalle,
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+
+def clerk_issuer() -> str:
+    """Deduce el emisor de los tokens a partir de la clave publicable de Clerk.
+
+    La clave tiene la forma pk_test_<base64("<frontend-api>$")>, así que no hace
+    falta una variable de entorno más con la URL de Clerk.
+    """
+    clave = os.getenv("VITE_CLERK_PUBLISHABLE_KEY", "")
+    try:
+        codificado = clave.split("_", 2)[2]
+        dominio = base64.b64decode(codificado + "=" * (-len(codificado) % 4)).decode()
+    except (IndexError, ValueError):
+        dominio = ""
+    if not dominio.endswith("$"):
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="La variable de entorno VITE_CLERK_PUBLISHABLE_KEY no está configurada en el servidor.",
+        )
+    return f"https://{dominio[:-1]}"
+
+
+@lru_cache(maxsize=4)
+def jwks_client(issuer: str) -> jwt.PyJWKClient:
+    """Cliente de claves públicas de Clerk, cacheado entre peticiones."""
+    return jwt.PyJWKClient(f"{issuer}/.well-known/jwks.json", cache_keys=True, lifespan=3600)
+
+
+def get_current_user(authorization: Optional[str] = Header(default=None)) -> str:
+    """Valida el token de sesión de Clerk y devuelve el id del usuario (claim sub)."""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise _error_401("Debes iniciar sesión para generar un plan.")
+    token = authorization.removeprefix("Bearer ").strip()
+
+    issuer = clerk_issuer()
+    try:
+        clave = jwks_client(issuer).get_signing_key_from_jwt(token)
+    except jwt.PyJWKClientConnectionError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="No se pudo contactar con Clerk para verificar la sesión.",
+        ) from exc
+    except (jwt.PyJWKClientError, jwt.InvalidTokenError) as exc:
+        raise _error_401("La sesión no es válida.") from exc
+
+    try:
+        claims = jwt.decode(
+            token,
+            clave.key,
+            algorithms=["RS256"],
+            issuer=issuer,
+            options={"require": ["exp", "iat", "iss", "sub"]},
+            leeway=5,
+        )
+    except jwt.ExpiredSignatureError as exc:
+        raise _error_401("La sesión ha caducado. Vuelve a iniciar sesión.") from exc
+    except jwt.InvalidTokenError as exc:
+        raise _error_401("La sesión no es válida.") from exc
+
+    origenes = os.getenv("CLERK_AUTHORIZED_PARTIES", ORIGENES_POR_DEFECTO)
+    permitidos = {origen.strip().rstrip("/") for origen in origenes.split(",") if origen.strip()}
+    if claims.get("azp") and claims["azp"] not in permitidos:
+        raise _error_401("La sesión procede de un origen no autorizado.")
+
+    return claims["sub"]
+
 
 # ---------------------------------------------------------------------------
 # 1. Esquemas de validación de entrada (primera barrera: HTTP 422)
@@ -965,7 +1067,7 @@ def health_check() -> dict:
 
 
 @app.post("/api/generate-plan", response_model=PlanResponse)
-def generate_plan(payload: PlanRequest) -> PlanResponse:
+def generate_plan(payload: PlanRequest, usuario: str = Depends(get_current_user)) -> PlanResponse:
     client = get_openai_client()
 
     try:
@@ -1030,17 +1132,31 @@ Once pruebas que cubren salud del servicio, las tres rutas de rechazo 422, los d
 """Suite de pruebas del backend de StudyUp.
 
 El proveedor de IA se sustituye siempre por un mock, de modo que la suite no
-consume tokens reales ni necesita una OPENAI_API_KEY válida.
+consume tokens reales ni necesita una OPENAI_API_KEY válida. Los tokens de Clerk
+se firman con una clave RSA generada aquí, así que tampoco hace falta red.
 """
 
+import base64
 import json
+import time
 from unittest.mock import MagicMock, patch
 
+import jwt
+import pytest
+from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi.testclient import TestClient
 
-from api.index import app
+from api.index import app, clerk_issuer, get_current_user
 
 client = TestClient(app)
+
+
+@pytest.fixture(autouse=True)
+def usuario_autenticado():
+    """Por defecto los tests asumen una sesión válida; los de Clerk la quitan."""
+    app.dependency_overrides[get_current_user] = lambda: "user_test"
+    yield
+    app.dependency_overrides.clear()
 
 PLAN_VALIDO = {
     "diagnostico": "Partes con el temario a medias, así que priorizamos lagunas y repaso activo.",
@@ -1212,6 +1328,106 @@ def test_sin_api_key_devuelve_500():
 
     assert response.status_code == 500
     assert "OPENAI_API_KEY" in response.json()["detail"]
+
+
+# ---------------------------------------------------------------------------
+# Autenticación con Clerk (HTTP 401): ningún rechazo debe llegar a la IA
+# ---------------------------------------------------------------------------
+
+DOMINIO_CLERK = "studyup-test.clerk.accounts.dev"
+ISSUER = f"https://{DOMINIO_CLERK}"
+CLAVE_PUBLICABLE = "pk_test_" + base64.b64encode(f"{DOMINIO_CLERK}$".encode()).decode()
+CLAVE_CLERK = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+OTRA_CLAVE = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+
+
+def _token(clave=CLAVE_CLERK, **cambios) -> str:
+    """Firma un token con la forma de un token de sesión de Clerk."""
+    ahora = int(time.time())
+    claims = {
+        "sub": "user_123",
+        "iss": ISSUER,
+        "iat": ahora,
+        "nbf": ahora,
+        "exp": ahora + 60,
+        "azp": "http://localhost:5173",
+        **cambios,
+    }
+    return jwt.encode(claims, clave, algorithm="RS256", headers={"kid": "clave-test"})
+
+
+@pytest.fixture
+def clerk_real():
+    """Quita la sesión simulada y sirve la clave pública de prueba como JWKS."""
+    app.dependency_overrides.clear()
+    jwks = MagicMock()
+    jwks.get_signing_key_from_jwt.return_value = MagicMock(key=CLAVE_CLERK.public_key())
+    with patch.dict("os.environ", {"VITE_CLERK_PUBLISHABLE_KEY": CLAVE_PUBLICABLE}), patch(
+        "api.index.jwks_client", return_value=jwks
+    ), patch("api.index.get_openai_client") as mock_get_client:
+        mock_get_client.return_value = _mock_client_con(json.dumps(PLAN_VALIDO))
+        yield mock_get_client
+
+
+def _pedir(token: str | None):
+    cabeceras = {"Authorization": f"Bearer {token}"} if token else {}
+    return client.post("/api/generate-plan", json=PETICION_VALIDA, headers=cabeceras)
+
+
+def test_el_emisor_se_deduce_de_la_clave_publicable():
+    with patch.dict("os.environ", {"VITE_CLERK_PUBLISHABLE_KEY": CLAVE_PUBLICABLE}):
+        assert clerk_issuer() == ISSUER
+
+
+def test_token_valido_genera_el_plan(clerk_real):
+    response = _pedir(_token())
+
+    assert response.status_code == 200
+    clerk_real.assert_called_once()
+
+
+def test_sin_token_devuelve_401(clerk_real):
+    response = _pedir(None)
+
+    assert response.status_code == 401
+    assert response.headers["WWW-Authenticate"] == "Bearer"
+    clerk_real.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "token",
+    [
+        "esto-no-es-un-jwt",
+        _token(clave=OTRA_CLAVE),
+        _token(iss="https://otro-proyecto.clerk.accounts.dev"),
+        _token(azp="https://web-ajena.example"),
+        jwt.encode({"sub": "user_123", "iss": ISSUER}, "s" * 32, algorithm="HS256"),
+    ],
+    ids=["mal_formado", "firma_ajena", "otro_emisor", "origen_no_autorizado", "algoritmo_hs256"],
+)
+def test_token_invalido_devuelve_401(clerk_real, token):
+    response = _pedir(token)
+
+    assert response.status_code == 401
+    clerk_real.assert_not_called()
+
+
+def test_token_caducado_devuelve_401(clerk_real):
+    hace_una_hora = int(time.time()) - 3600
+    response = _pedir(_token(iat=hace_una_hora, nbf=hace_una_hora, exp=hace_una_hora + 60))
+
+    assert response.status_code == 401
+    assert "caducado" in response.json()["detail"]
+    clerk_real.assert_not_called()
+
+
+def test_sin_clave_de_clerk_devuelve_500(clerk_real):
+    with patch.dict("os.environ", {}, clear=True):
+        response = _pedir(_token())
+
+    assert response.status_code == 500
+    assert "VITE_CLERK_PUBLISHABLE_KEY" in response.json()["detail"]
+    clerk_real.assert_not_called()
 ````
 
 
@@ -1298,16 +1514,25 @@ input[type='range']::-moz-range-thumb {
 #### `src/main.ts`
 ```typescript
 import { createApp } from 'vue';
+import { clerkPlugin } from '@clerk/vue';
+import { esES } from '@clerk/localizations';
 import './style.css';
 import App from './App.vue';
 
-createApp(App).mount('#app');
+// Clave publicable: está pensada para viajar en el bundle. La secreta nunca va aquí.
+const publishableKey = import.meta.env.VITE_CLERK_PUBLISHABLE_KEY;
+if (!publishableKey) {
+  throw new Error('Falta VITE_CLERK_PUBLISHABLE_KEY en el archivo .env');
+}
+
+createApp(App).use(clerkPlugin, { publishableKey, localization: esES }).mount('#app');
 ```
 
 #### `src/App.vue`
 ```vue
 <script setup lang="ts">
 import { computed, ref } from 'vue';
+import { Show, SignInButton, UserButton, useAuth } from '@clerk/vue';
 import {
   AlertCircle,
   Brain,
@@ -1316,6 +1541,7 @@ import {
   GraduationCap,
   Layers,
   Loader2,
+  Lock,
   Repeat,
   Sparkles,
   Target,
@@ -1348,6 +1574,9 @@ const OPCIONES_RECURSOS: Opcion<Recurso>[] = [
   { id: 'ejercicios', label: 'Ejercicios y problemas' },
   { id: 'flashcards', label: 'Flashcards / Anki' },
 ];
+
+// --- Sesión de Clerk -------------------------------------------------------
+const { getToken } = useAuth();
 
 // --- Estado reactivo -------------------------------------------------------
 const meta = ref<Meta>('aprobar');
@@ -1401,9 +1630,15 @@ const handleSubmit = async (): Promise<void> => {
   };
 
   try {
+    // El backend valida este token con Clerk antes de llamar a la IA.
+    const token = await getToken.value();
+    if (!token) {
+      throw new Error('Tu sesión ha caducado. Vuelve a iniciar sesión.');
+    }
+
     const response = await fetch('/api/generate-plan', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
       body: JSON.stringify(payload),
     });
 
@@ -1429,7 +1664,12 @@ const handleSubmit = async (): Promise<void> => {
   <main class="min-h-screen bg-slate-950 px-4 py-10 text-slate-100 sm:px-6 lg:px-8">
     <div class="mx-auto max-w-4xl space-y-8">
       <!-- Cabecera -->
-      <header class="space-y-2 text-center">
+      <header class="relative space-y-2 text-center">
+        <div class="absolute right-0 top-0">
+          <Show when="signed-in">
+            <UserButton />
+          </Show>
+        </div>
         <div
           class="mb-2 inline-flex items-center justify-center rounded-2xl border border-indigo-500/20 bg-indigo-500/10 p-3 text-indigo-400"
         >
@@ -1444,259 +1684,282 @@ const handleSubmit = async (): Promise<void> => {
         </p>
       </header>
 
-      <!-- Formulario de entrada (4 parámetros) -->
-      <section class="rounded-2xl border border-slate-800 bg-slate-900 p-6 shadow-xl sm:p-8">
-        <form class="space-y-6" @submit.prevent="handleSubmit">
-          <fieldset :disabled="loading" class="space-y-6 disabled:opacity-60">
-            <div class="grid grid-cols-1 gap-6 md:grid-cols-2">
-              <!-- 1. Meta -->
-              <div>
-                <label
-                  for="campo-meta"
-                  class="mb-2 flex items-center text-sm font-semibold text-slate-300"
-                >
-                  <Target class="mr-2 h-4 w-4 text-indigo-400" />
-                  1. Meta del estudio
-                </label>
-                <select
-                  id="campo-meta"
-                  v-model="meta"
-                  aria-label="Meta del estudio"
-                  class="w-full rounded-xl border border-slate-700 bg-slate-800 px-4 py-3 text-slate-100 focus:outline-none focus:ring-2 focus:ring-indigo-500 disabled:cursor-not-allowed"
-                >
-                  <option v-for="opcion in OPCIONES_META" :key="opcion.id" :value="opcion.id">
-                    {{ opcion.label }}
-                  </option>
-                </select>
-              </div>
-
-              <!-- 2. Días disponibles -->
-              <div>
-                <div class="mb-2 flex items-center justify-between">
-                  <label
-                    for="campo-dias"
-                    class="flex items-center text-sm font-semibold text-slate-300"
-                  >
-                    <CalendarDays class="mr-2 h-4 w-4 text-indigo-400" />
-                    2. Días hasta el examen
-                  </label>
-                  <span
-                    class="rounded-md bg-indigo-500/20 px-2.5 py-1 text-xs font-bold text-indigo-300"
-                  >
-                    {{ diasDisponibles }} {{ diasDisponibles === 1 ? 'día' : 'días' }}
-                  </span>
-                </div>
-                <input
-                  id="campo-dias"
-                  v-model.number="diasDisponibles"
-                  type="range"
-                  aria-label="Días hasta el examen"
-                  min="1"
-                  max="30"
-                  step="1"
-                  class="h-2 w-full cursor-pointer appearance-none rounded-lg bg-slate-700 disabled:cursor-not-allowed"
-                />
-                <div class="mt-1 flex justify-between text-xs text-slate-500">
-                  <span>1 día</span>
-                  <span>15 días</span>
-                  <span>30 días</span>
-                </div>
-              </div>
-
-              <!-- 3. Nivel de partida -->
-              <div>
-                <label
-                  for="campo-nivel"
-                  class="mb-2 flex items-center text-sm font-semibold text-slate-300"
-                >
-                  <Brain class="mr-2 h-4 w-4 text-indigo-400" />
-                  3. Nivel de partida
-                </label>
-                <select
-                  id="campo-nivel"
-                  v-model="nivel"
-                  aria-label="Nivel de partida"
-                  class="w-full rounded-xl border border-slate-700 bg-slate-800 px-4 py-3 text-slate-100 focus:outline-none focus:ring-2 focus:ring-indigo-500 disabled:cursor-not-allowed"
-                >
-                  <option v-for="opcion in OPCIONES_NIVEL" :key="opcion.id" :value="opcion.id">
-                    {{ opcion.label }}
-                  </option>
-                </select>
-              </div>
-
-              <!-- 4. Recursos disponibles -->
-              <div>
-                <span class="mb-2 flex items-center text-sm font-semibold text-slate-300">
-                  <Layers class="mr-2 h-4 w-4 text-indigo-400" />
-                  4. Recursos disponibles
-                </span>
-                <div class="flex flex-wrap gap-2">
-                  <button
-                    v-for="opcion in OPCIONES_RECURSOS"
-                    :key="opcion.id"
-                    type="button"
-                    :aria-pressed="recursos.includes(opcion.id)"
-                    :class="[
-                      'rounded-lg border px-3 py-2 text-xs font-medium transition disabled:cursor-not-allowed',
-                      recursos.includes(opcion.id)
-                        ? 'border-indigo-400 bg-indigo-500 font-semibold text-slate-950'
-                        : 'border-slate-700 bg-slate-800 text-slate-400 hover:border-slate-600',
-                    ]"
-                    @click="toggleRecurso(opcion.id)"
-                  >
-                    {{ opcion.label }}
-                  </button>
-                </div>
-                <p class="mt-2 text-xs text-slate-500">
-                  Debe quedar al menos un recurso seleccionado.
-                </p>
-              </div>
-            </div>
-          </fieldset>
-
-          <!-- Botón de envío -->
-          <button
-            type="submit"
-            :disabled="loading"
-            class="flex w-full items-center justify-center gap-2 rounded-xl bg-indigo-500 px-6 py-3.5 font-bold text-white shadow-lg shadow-indigo-500/20 transition duration-150 hover:bg-indigo-400 disabled:cursor-not-allowed disabled:opacity-50"
+      <!-- Sin sesión: solo se ofrece iniciar sesión -->
+      <Show when="signed-in">
+        <template #fallback>
+          <section
+            class="flex flex-col items-center gap-4 rounded-2xl border border-slate-800 bg-slate-900 p-8 text-center shadow-xl"
           >
-            <template v-if="loading">
-              <Loader2 class="h-5 w-5 animate-spin" />
-              <span>Diseñando tu plan de estudio...</span>
-            </template>
-            <template v-else>
-              <Sparkles class="h-5 w-5" />
-              <span>Generar plan con IA</span>
-            </template>
-          </button>
-        </form>
-      </section>
-
-      <!-- Alerta de error (RF-05) -->
-      <section
-        v-if="error"
-        role="alert"
-        class="flex items-start gap-3 rounded-xl border border-rose-800 bg-rose-950/40 p-4 text-rose-300"
-      >
-        <AlertCircle class="mt-0.5 h-5 w-5 flex-shrink-0 text-rose-400" />
-        <div>
-          <h2 class="text-sm font-semibold text-rose-200">Error en la petición</h2>
-          <p class="text-sm">{{ error }}</p>
-        </div>
-      </section>
-
-      <!-- Plan generado -->
-      <article
-        v-if="plan"
-        class="space-y-6 rounded-2xl border border-slate-800 bg-slate-900 p-6 shadow-2xl sm:p-8"
-      >
-        <div
-          class="flex flex-col justify-between gap-2 border-b border-slate-800 pb-4 sm:flex-row sm:items-center"
-        >
-          <div>
-            <h2 class="flex items-center gap-2 text-xl font-bold text-white sm:text-2xl">
-              <CheckCircle2 class="h-6 w-6 text-indigo-400" />
-              Tu plan de estudio
-            </h2>
-            <p class="text-sm text-slate-400">
-              {{ etiquetaMeta }} • {{ diasDisponibles }}
-              {{ diasDisponibles === 1 ? 'día' : 'días' }} • nivel {{ nivel }}
+            <Lock class="h-8 w-8 text-indigo-400" />
+            <h2 class="text-xl font-bold text-white">Inicia sesión para crear tu plan</h2>
+            <p class="max-w-md text-sm text-slate-400">
+              Necesitas una cuenta para generar planes de estudio con IA.
             </p>
-          </div>
-          <div
-            class="w-fit rounded-lg border border-slate-700 bg-slate-800 px-3 py-1.5 text-xs font-semibold text-indigo-300"
-          >
-            {{ plan.horas_totales_estimadas }} h estimadas
-          </div>
-        </div>
-
-        <!-- Diagnóstico -->
-        <div class="rounded-xl border border-slate-800/80 bg-slate-950 p-4">
-          <h3 class="mb-1 text-xs font-semibold uppercase tracking-wider text-indigo-400">
-            Fase 1: Diagnóstico y estrategia
-          </h3>
-          <p class="text-sm text-slate-300">{{ plan.diagnostico }}</p>
-        </div>
-
-        <!-- Calendario de sesiones -->
-        <div class="space-y-3">
-          <h3 class="text-xs font-semibold uppercase tracking-wider text-indigo-400">
-            Fase 2: Calendario de sesiones
-          </h3>
-          <div
-            v-for="grupo in sesionesPorDia"
-            :key="grupo.dia"
-            class="rounded-xl border border-slate-800 bg-slate-950 p-4"
-          >
-            <div class="mb-3 flex items-center gap-2">
-              <span
-                class="rounded border border-indigo-800 bg-indigo-950/70 px-2 py-0.5 text-xs font-bold text-indigo-300"
+            <SignInButton mode="modal">
+              <button
+                type="button"
+                class="rounded-xl bg-indigo-500 px-6 py-3 font-bold text-white shadow-lg shadow-indigo-500/20 transition hover:bg-indigo-400"
               >
-                Día {{ grupo.dia }}
-              </span>
-              <span class="text-xs text-slate-500">
-                {{ grupo.sesiones.length }}
-                {{ grupo.sesiones.length === 1 ? 'sesión' : 'sesiones' }}
-              </span>
-            </div>
+                Iniciar sesión
+              </button>
+            </SignInButton>
+          </section>
+        </template>
 
-            <div class="space-y-3">
-              <div
-                v-for="(sesion, indice) in grupo.sesiones"
-                :key="`${grupo.dia}-${indice}`"
-                class="flex flex-col justify-between gap-4 rounded-lg border border-slate-800 bg-slate-900 p-4 sm:flex-row sm:items-center"
-              >
-                <div class="space-y-1">
-                  <h4 class="text-base font-bold text-white">{{ sesion.titulo }}</h4>
-                  <p class="text-xs font-medium text-indigo-300">{{ sesion.tecnica }}</p>
-                  <p class="text-xs text-slate-400">{{ sesion.consejo }}</p>
+        <!-- Formulario de entrada (4 parámetros) -->
+        <section class="rounded-2xl border border-slate-800 bg-slate-900 p-6 shadow-xl sm:p-8">
+          <form class="space-y-6" @submit.prevent="handleSubmit">
+            <fieldset :disabled="loading" class="space-y-6 disabled:opacity-60">
+              <div class="grid grid-cols-1 gap-6 md:grid-cols-2">
+                <!-- 1. Meta -->
+                <div>
+                  <label
+                    for="campo-meta"
+                    class="mb-2 flex items-center text-sm font-semibold text-slate-300"
+                  >
+                    <Target class="mr-2 h-4 w-4 text-indigo-400" />
+                    1. Meta del estudio
+                  </label>
+                  <select
+                    id="campo-meta"
+                    v-model="meta"
+                    aria-label="Meta del estudio"
+                    class="w-full rounded-xl border border-slate-700 bg-slate-800 px-4 py-3 text-slate-100 focus:outline-none focus:ring-2 focus:ring-indigo-500 disabled:cursor-not-allowed"
+                  >
+                    <option v-for="opcion in OPCIONES_META" :key="opcion.id" :value="opcion.id">
+                      {{ opcion.label }}
+                    </option>
+                  </select>
                 </div>
 
-                <div
-                  class="flex items-center gap-4 rounded-lg border border-slate-800 bg-slate-950 px-3 py-2 text-xs font-medium text-slate-300"
+                <!-- 2. Días disponibles -->
+                <div>
+                  <div class="mb-2 flex items-center justify-between">
+                    <label
+                      for="campo-dias"
+                      class="flex items-center text-sm font-semibold text-slate-300"
+                    >
+                      <CalendarDays class="mr-2 h-4 w-4 text-indigo-400" />
+                      2. Días hasta el examen
+                    </label>
+                    <span
+                      class="rounded-md bg-indigo-500/20 px-2.5 py-1 text-xs font-bold text-indigo-300"
+                    >
+                      {{ diasDisponibles }} {{ diasDisponibles === 1 ? 'día' : 'días' }}
+                    </span>
+                  </div>
+                  <input
+                    id="campo-dias"
+                    v-model.number="diasDisponibles"
+                    type="range"
+                    aria-label="Días hasta el examen"
+                    min="1"
+                    max="30"
+                    step="1"
+                    class="h-2 w-full cursor-pointer appearance-none rounded-lg bg-slate-700 disabled:cursor-not-allowed"
+                  />
+                  <div class="mt-1 flex justify-between text-xs text-slate-500">
+                    <span>1 día</span>
+                    <span>15 días</span>
+                    <span>30 días</span>
+                  </div>
+                </div>
+
+                <!-- 3. Nivel de partida -->
+                <div>
+                  <label
+                    for="campo-nivel"
+                    class="mb-2 flex items-center text-sm font-semibold text-slate-300"
+                  >
+                    <Brain class="mr-2 h-4 w-4 text-indigo-400" />
+                    3. Nivel de partida
+                  </label>
+                  <select
+                    id="campo-nivel"
+                    v-model="nivel"
+                    aria-label="Nivel de partida"
+                    class="w-full rounded-xl border border-slate-700 bg-slate-800 px-4 py-3 text-slate-100 focus:outline-none focus:ring-2 focus:ring-indigo-500 disabled:cursor-not-allowed"
+                  >
+                    <option v-for="opcion in OPCIONES_NIVEL" :key="opcion.id" :value="opcion.id">
+                      {{ opcion.label }}
+                    </option>
+                  </select>
+                </div>
+
+                <!-- 4. Recursos disponibles -->
+                <div>
+                  <span class="mb-2 flex items-center text-sm font-semibold text-slate-300">
+                    <Layers class="mr-2 h-4 w-4 text-indigo-400" />
+                    4. Recursos disponibles
+                  </span>
+                  <div class="flex flex-wrap gap-2">
+                    <button
+                      v-for="opcion in OPCIONES_RECURSOS"
+                      :key="opcion.id"
+                      type="button"
+                      :aria-pressed="recursos.includes(opcion.id)"
+                      :class="[
+                        'rounded-lg border px-3 py-2 text-xs font-medium transition disabled:cursor-not-allowed',
+                        recursos.includes(opcion.id)
+                          ? 'border-indigo-400 bg-indigo-500 font-semibold text-slate-950'
+                          : 'border-slate-700 bg-slate-800 text-slate-400 hover:border-slate-600',
+                      ]"
+                      @click="toggleRecurso(opcion.id)"
+                    >
+                      {{ opcion.label }}
+                    </button>
+                  </div>
+                  <p class="mt-2 text-xs text-slate-500">
+                    Debe quedar al menos un recurso seleccionado.
+                  </p>
+                </div>
+              </div>
+            </fieldset>
+
+            <!-- Botón de envío -->
+            <button
+              type="submit"
+              :disabled="loading"
+              class="flex w-full items-center justify-center gap-2 rounded-xl bg-indigo-500 px-6 py-3.5 font-bold text-white shadow-lg shadow-indigo-500/20 transition duration-150 hover:bg-indigo-400 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              <template v-if="loading">
+                <Loader2 class="h-5 w-5 animate-spin" />
+                <span>Diseñando tu plan de estudio...</span>
+              </template>
+              <template v-else>
+                <Sparkles class="h-5 w-5" />
+                <span>Generar plan con IA</span>
+              </template>
+            </button>
+          </form>
+        </section>
+
+        <!-- Alerta de error (RF-05) -->
+        <section
+          v-if="error"
+          role="alert"
+          class="flex items-start gap-3 rounded-xl border border-rose-800 bg-rose-950/40 p-4 text-rose-300"
+        >
+          <AlertCircle class="mt-0.5 h-5 w-5 flex-shrink-0 text-rose-400" />
+          <div>
+            <h2 class="text-sm font-semibold text-rose-200">Error en la petición</h2>
+            <p class="text-sm">{{ error }}</p>
+          </div>
+        </section>
+
+        <!-- Plan generado -->
+        <article
+          v-if="plan"
+          class="space-y-6 rounded-2xl border border-slate-800 bg-slate-900 p-6 shadow-2xl sm:p-8"
+        >
+          <div
+            class="flex flex-col justify-between gap-2 border-b border-slate-800 pb-4 sm:flex-row sm:items-center"
+          >
+            <div>
+              <h2 class="flex items-center gap-2 text-xl font-bold text-white sm:text-2xl">
+                <CheckCircle2 class="h-6 w-6 text-indigo-400" />
+                Tu plan de estudio
+              </h2>
+              <p class="text-sm text-slate-400">
+                {{ etiquetaMeta }} • {{ diasDisponibles }}
+                {{ diasDisponibles === 1 ? 'día' : 'días' }} • nivel {{ nivel }}
+              </p>
+            </div>
+            <div
+              class="w-fit rounded-lg border border-slate-700 bg-slate-800 px-3 py-1.5 text-xs font-semibold text-indigo-300"
+            >
+              {{ plan.horas_totales_estimadas }} h estimadas
+            </div>
+          </div>
+
+          <!-- Diagnóstico -->
+          <div class="rounded-xl border border-slate-800/80 bg-slate-950 p-4">
+            <h3 class="mb-1 text-xs font-semibold uppercase tracking-wider text-indigo-400">
+              Fase 1: Diagnóstico y estrategia
+            </h3>
+            <p class="text-sm text-slate-300">{{ plan.diagnostico }}</p>
+          </div>
+
+          <!-- Calendario de sesiones -->
+          <div class="space-y-3">
+            <h3 class="text-xs font-semibold uppercase tracking-wider text-indigo-400">
+              Fase 2: Calendario de sesiones
+            </h3>
+            <div
+              v-for="grupo in sesionesPorDia"
+              :key="grupo.dia"
+              class="rounded-xl border border-slate-800 bg-slate-950 p-4"
+            >
+              <div class="mb-3 flex items-center gap-2">
+                <span
+                  class="rounded border border-indigo-800 bg-indigo-950/70 px-2 py-0.5 text-xs font-bold text-indigo-300"
                 >
-                  <div>
-                    <span class="block text-slate-500">Duración</span>
-                    <span class="font-bold text-white">{{ sesion.duracion_minutos }} min</span>
+                  Día {{ grupo.dia }}
+                </span>
+                <span class="text-xs text-slate-500">
+                  {{ grupo.sesiones.length }}
+                  {{ grupo.sesiones.length === 1 ? 'sesión' : 'sesiones' }}
+                </span>
+              </div>
+
+              <div class="space-y-3">
+                <div
+                  v-for="(sesion, indice) in grupo.sesiones"
+                  :key="`${grupo.dia}-${indice}`"
+                  class="flex flex-col justify-between gap-4 rounded-lg border border-slate-800 bg-slate-900 p-4 sm:flex-row sm:items-center"
+                >
+                  <div class="space-y-1">
+                    <h4 class="text-base font-bold text-white">{{ sesion.titulo }}</h4>
+                    <p class="text-xs font-medium text-indigo-300">{{ sesion.tecnica }}</p>
+                    <p class="text-xs text-slate-400">{{ sesion.consejo }}</p>
                   </div>
-                  <div class="h-6 w-px bg-slate-800" />
-                  <div>
-                    <span class="block text-slate-500">Recurso</span>
-                    <span class="font-bold text-white">{{ sesion.recurso_principal }}</span>
-                  </div>
-                  <div class="h-6 w-px bg-slate-800" />
-                  <div>
-                    <span class="block text-slate-500">Carga</span>
-                    <span class="font-bold text-indigo-400">{{ sesion.carga_cognitiva }}</span>
+
+                  <div
+                    class="flex items-center gap-4 rounded-lg border border-slate-800 bg-slate-950 px-3 py-2 text-xs font-medium text-slate-300"
+                  >
+                    <div>
+                      <span class="block text-slate-500">Duración</span>
+                      <span class="font-bold text-white">{{ sesion.duracion_minutos }} min</span>
+                    </div>
+                    <div class="h-6 w-px bg-slate-800" />
+                    <div>
+                      <span class="block text-slate-500">Recurso</span>
+                      <span class="font-bold text-white">{{ sesion.recurso_principal }}</span>
+                    </div>
+                    <div class="h-6 w-px bg-slate-800" />
+                    <div>
+                      <span class="block text-slate-500">Carga</span>
+                      <span class="font-bold text-indigo-400">{{ sesion.carga_cognitiva }}</span>
+                    </div>
                   </div>
                 </div>
               </div>
             </div>
           </div>
-        </div>
 
-        <!-- Repaso espaciado -->
-        <div class="rounded-xl border border-slate-800/80 bg-slate-950 p-4">
-          <h3
-            class="mb-1 flex items-center gap-2 text-xs font-semibold uppercase tracking-wider text-indigo-400"
-          >
-            <Repeat class="h-3.5 w-3.5" />
-            Fase 3: Repaso espaciado
-          </h3>
-          <p class="text-sm text-slate-300">{{ plan.repaso_espaciado }}</p>
-        </div>
+          <!-- Repaso espaciado -->
+          <div class="rounded-xl border border-slate-800/80 bg-slate-950 p-4">
+            <h3
+              class="mb-1 flex items-center gap-2 text-xs font-semibold uppercase tracking-wider text-indigo-400"
+            >
+              <Repeat class="h-3.5 w-3.5" />
+              Fase 3: Repaso espaciado
+            </h3>
+            <p class="text-sm text-slate-300">{{ plan.repaso_espaciado }}</p>
+          </div>
 
-        <!-- Plan de contingencia -->
-        <div class="rounded-xl border border-indigo-800/40 bg-indigo-950/20 p-4">
-          <h3
-            class="mb-1 flex items-center gap-2 text-xs font-bold uppercase tracking-wider text-indigo-300"
-          >
-            <Zap class="h-3.5 w-3.5" />
-            ¿Solo tienes 20 minutos hoy?
-          </h3>
-          <p class="text-xs text-slate-300">{{ plan.alternativa_rapida }}</p>
-        </div>
-      </article>
+          <!-- Plan de contingencia -->
+          <div class="rounded-xl border border-indigo-800/40 bg-indigo-950/20 p-4">
+            <h3
+              class="mb-1 flex items-center gap-2 text-xs font-bold uppercase tracking-wider text-indigo-300"
+            >
+              <Zap class="h-3.5 w-3.5" />
+              ¿Solo tienes 20 minutos hoy?
+            </h3>
+            <p class="text-xs text-slate-300">{{ plan.alternativa_rapida }}</p>
+          </div>
+        </article>
+      </Show>
     </div>
   </main>
 </template>
@@ -1715,6 +1978,25 @@ import { flushPromises, mount } from '@vue/test-utils';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import App from '../src/App.vue';
 import type { PlanResponse } from '../src/types/plan';
+
+// Clerk simulado: cada test decide si hay sesión y qué token devuelve.
+const clerk = vi.hoisted(() => ({ signedIn: true, token: 'token-de-prueba' as string | null }));
+
+vi.mock('@clerk/vue', async () => {
+  const { defineComponent, h, ref } = await import('vue');
+  return {
+    Show: defineComponent({
+      props: ['when'],
+      setup: (_, { slots }) => () => (clerk.signedIn ? slots.default?.() : slots.fallback?.()),
+    }),
+    SignInButton: defineComponent({
+      props: ['mode'],
+      setup: (_, { slots }) => () => slots.default?.(),
+    }),
+    UserButton: defineComponent({ setup: () => () => h('div', { 'data-test': 'user-button' }) }),
+    useAuth: () => ({ getToken: ref(async () => clerk.token) }),
+  };
+});
 
 const PLAN_MOCK: PlanResponse = {
   diagnostico: 'Tienes el temario a medias, así que atacamos primero las lagunas.',
@@ -1756,6 +2038,8 @@ const mockFetchOk = (plan: PlanResponse = PLAN_MOCK) => {
 describe('StudyUp - componente App.vue', () => {
   beforeEach(() => {
     vi.restoreAllMocks();
+    clerk.signedIn = true;
+    clerk.token = 'token-de-prueba';
   });
 
   afterEach(() => {
@@ -1783,6 +2067,9 @@ describe('StudyUp - componente App.vue', () => {
     const [url, opciones] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(url).toBe('/api/generate-plan');
     expect(opciones.method).toBe('POST');
+    expect((opciones.headers as Record<string, string>).Authorization).toBe(
+      'Bearer token-de-prueba',
+    );
     expect(JSON.parse(opciones.body as string)).toEqual({
       meta: 'aprobar',
       dias_disponibles: 7,
@@ -1880,6 +2167,27 @@ describe('StudyUp - componente App.vue', () => {
 
     expect(wrapper.find('fieldset').attributes('disabled')).toBeUndefined();
     expect(wrapper.text()).toContain('Tu plan de estudio');
+  });
+
+  it('sin sesión muestra el acceso y oculta el formulario', () => {
+    clerk.signedIn = false;
+    const wrapper = mount(App);
+
+    expect(wrapper.text()).toContain('Inicia sesión para crear tu plan');
+    expect(wrapper.find('form').exists()).toBe(false);
+    expect(wrapper.find('[data-test="user-button"]').exists()).toBe(false);
+  });
+
+  it('no llama al backend si Clerk no entrega un token', async () => {
+    clerk.token = null;
+    const fetchMock = mockFetchOk();
+    const wrapper = mount(App);
+
+    await wrapper.find('form').trigger('submit.prevent');
+    await flushPromises();
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(wrapper.text()).toContain('Tu sesión ha caducado');
   });
 });
 ```
