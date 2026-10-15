@@ -13,9 +13,10 @@ from unittest.mock import MagicMock, patch
 import jwt
 import pytest
 from cryptography.hazmat.primitives.asymmetric import rsa
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from api.index import app, clerk_issuer, get_current_user
+from api.index import app, clerk_issuer, get_current_user, montar_frontend
 
 client = TestClient(app)
 
@@ -197,6 +198,22 @@ def test_sin_api_key_devuelve_500():
 
     assert response.status_code == 500
     assert "OPENAI_API_KEY" in response.json()["detail"]
+
+
+# ---------------------------------------------------------------------------
+# Contenedor Docker: un único proceso sirve la SPA y la API
+# ---------------------------------------------------------------------------
+
+
+def test_el_contenedor_sirve_la_spa_sin_tapar_la_api(tmp_path):
+    (tmp_path / "index.html").write_text('<div id="app"></div>', encoding="utf-8")
+    aplicacion = FastAPI()
+    aplicacion.include_router(app.router)
+    montar_frontend(aplicacion, str(tmp_path))
+    cliente = TestClient(aplicacion)
+
+    assert '<div id="app">' in cliente.get("/").text
+    assert cliente.get("/api/health").json()["status"] == "ok"
 
 
 # ---------------------------------------------------------------------------

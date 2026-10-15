@@ -14,6 +14,7 @@ from typing import List, Optional
 import jwt
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException, status
+from fastapi.staticfiles import StaticFiles
 from openai import OpenAI, OpenAIError
 from pydantic import BaseModel, Field, ValidationError
 
@@ -325,3 +326,22 @@ def generate_plan(payload: PlanRequest, usuario: str = Depends(get_current_user)
         )
 
     return plan
+
+
+# ---------------------------------------------------------------------------
+# 5. Frontend compilado (solo en el contenedor Docker)
+# ---------------------------------------------------------------------------
+
+
+def montar_frontend(aplicacion: FastAPI, directorio: Optional[str]) -> None:
+    """Sirve la SPA compilada desde FastAPI, detrás de las rutas /api.
+
+    En Vercel el frontend lo sirve su CDN y FRONTEND_DIR no existe. En Docker la
+    define el Dockerfile, y un único proceso sirve la web y la API.
+    """
+    if directorio:
+        aplicacion.mount("/", StaticFiles(directory=directorio, html=True), name="frontend")
+
+
+# Se monta al final para que las rutas /api tengan prioridad.
+montar_frontend(app, os.getenv("FRONTEND_DIR"))

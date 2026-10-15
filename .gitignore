@@ -7,4 +7,6 @@ __pycache__
 dist
 .vercel
 .env
+studyup.env
+*.pem
 .DS_Store

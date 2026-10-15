@@ -1,0 +1,23 @@
+# Secretos: nunca entran en la imagen
+.env
+.env.*
+*.pem
+studyup.env
+
+# Se regeneran dentro de la imagen
+node_modules
+dist
+.venv
+venv
+__pycache__
+*.pyc
+.pytest_cache
+
+# Material que el contenedor no necesita
+.git
+.vercel
+tests
+tools
+evidencias
+AWS_Academy_Guias_G01_G16
+*.md
