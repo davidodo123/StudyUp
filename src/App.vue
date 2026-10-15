@@ -43,6 +43,10 @@ const OPCIONES_RECURSOS: Opcion<Recurso>[] = [
   { id: 'flashcards', label: 'Flashcards / Anki' },
 ];
 
+// Vacía en Vercel y en el contenedor completo (misma dirección que la web).
+// Con la web en S3 apunta a la API de EC2, por ejemplo http://3.85.109.39
+const API_URL = (import.meta.env.VITE_API_URL ?? '').replace(/\/$/, '');
+
 // --- Sesión de Clerk -------------------------------------------------------
 const { getToken } = useAuth();
 
@@ -104,7 +108,7 @@ const handleSubmit = async (): Promise<void> => {
       throw new Error('Tu sesión ha caducado. Vuelve a iniciar sesión.');
     }
 
-    const response = await fetch('/api/generate-plan', {
+    const response = await fetch(`${API_URL}/api/generate-plan`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
       body: JSON.stringify(payload),

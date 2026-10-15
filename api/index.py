@@ -14,6 +14,7 @@ from typing import List, Optional
 import jwt
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException, status
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from openai import OpenAI, OpenAIError
 from pydantic import BaseModel, Field, ValidationError
@@ -329,8 +330,26 @@ def generate_plan(payload: PlanRequest, usuario: str = Depends(get_current_user)
 
 
 # ---------------------------------------------------------------------------
-# 5. Frontend compilado (solo en el contenedor Docker)
+# 5. CORS y frontend compilado (solo fuera de Vercel)
 # ---------------------------------------------------------------------------
+
+
+def configurar_cors(aplicacion: FastAPI, origenes: Optional[str]) -> None:
+    """Permite llamadas desde otros orígenes, solo los indicados en CORS_ORIGINS.
+
+    En Vercel y en el contenedor completo la web y la API comparten origen y no
+    hace falta. En AWS la web está en un bucket de S3 y la API en EC2: son
+    orígenes distintos. CORS no sustituye a Clerk: el token se sigue exigiendo.
+    """
+    permitidos = [origen.strip().rstrip("/") for origen in (origenes or "").split(",") if origen.strip()]
+    if permitidos:
+        aplicacion.add_middleware(
+            CORSMiddleware,
+            allow_origins=permitidos,
+            allow_methods=["GET", "POST"],
+            allow_headers=["Authorization", "Content-Type"],
+        )
+
 
 
 def montar_frontend(aplicacion: FastAPI, directorio: Optional[str]) -> None:
@@ -343,5 +362,6 @@ def montar_frontend(aplicacion: FastAPI, directorio: Optional[str]) -> None:
         aplicacion.mount("/", StaticFiles(directory=directorio, html=True), name="frontend")
 
 
+configurar_cors(app, os.getenv("CORS_ORIGINS"))
 # Se monta al final para que las rutas /api tengan prioridad.
 montar_frontend(app, os.getenv("FRONTEND_DIR"))

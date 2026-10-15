@@ -19,6 +19,8 @@ COPY public ./public
 COPY src ./src
 
 ARG VITE_CLERK_PUBLISHABLE_KEY
+# Solo para la web en S3: dirección de la API en EC2. Vacía = misma dirección.
+ARG VITE_API_URL=
 RUN test -n "$VITE_CLERK_PUBLISHABLE_KEY" || { echo "Falta --build-arg VITE_CLERK_PUBLISHABLE_KEY"; exit 1; }
 RUN npm run build
 

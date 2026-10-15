@@ -2,6 +2,8 @@
 
 interface ImportMetaEnv {
   readonly VITE_CLERK_PUBLISHABLE_KEY: string;
+  /** Dirección de la API cuando está en otro dominio (web en S3, API en EC2). */
+  readonly VITE_API_URL?: string;
 }
 
 interface ImportMeta {

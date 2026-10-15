@@ -16,7 +16,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from api.index import app, clerk_issuer, get_current_user, montar_frontend
+from api.index import app, clerk_issuer, configurar_cors, get_current_user, montar_frontend
 
 client = TestClient(app)
 
@@ -214,6 +214,49 @@ def test_el_contenedor_sirve_la_spa_sin_tapar_la_api(tmp_path):
 
     assert '<div id="app">' in cliente.get("/").text
     assert cliente.get("/api/health").json()["status"] == "ok"
+
+
+# ---------------------------------------------------------------------------
+# AWS en dos partes: web en S3, API en EC2 (CORS limitado al bucket)
+# ---------------------------------------------------------------------------
+
+WEB_S3 = "http://studyup-web.s3-website-us-east-1.amazonaws.com"
+
+
+def _cliente_con_cors(origenes):
+    aplicacion = FastAPI()
+    aplicacion.include_router(app.router)
+    configurar_cors(aplicacion, origenes)
+    return TestClient(aplicacion)
+
+
+def _preflight(cliente, origen):
+    return cliente.options(
+        "/api/generate-plan",
+        headers={
+            "Origin": origen,
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "authorization,content-type",
+        },
+    )
+
+
+def test_cors_permite_solo_la_web_de_s3():
+    cliente = _cliente_con_cors(WEB_S3 + "/")
+
+    permitida = _preflight(cliente, WEB_S3)
+    assert permitida.status_code == 200
+    assert permitida.headers["access-control-allow-origin"] == WEB_S3
+
+    ajena = _preflight(cliente, "https://web-ajena.example")
+    assert "access-control-allow-origin" not in ajena.headers
+
+
+def test_sin_cors_origins_no_se_activa_cors():
+    """En Vercel y en el contenedor completo la web y la API comparten origen."""
+    respuesta = _preflight(_cliente_con_cors(None), WEB_S3)
+
+    assert "access-control-allow-origin" not in respuesta.headers
 
 
 # ---------------------------------------------------------------------------
